@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "Toyo Cushion Lanka - Coir Cutter",
+    "slug": "toyo-cushion-cutter",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#064e3b"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.hayleys.toyocushion.cutter"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#064e3b"
+      },
+      "package": "com.hayleys.toyocushion.cutter"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [],
+    "extra": {
+      "company": "Toyo Cushion Lanka",
+      "sector": "Hayleys Eco Solutions Sector",
+      "machine": "Rubberised Coir Fleece Cutting machine",
+      "firebaseProjectId": "msc-mobile-computing-project",
+      "apiBaseUrl": "https://api-auc2wpy33q-uc.a.run.app",
+      "eas": {
+        "projectId": "25ebe6ed-2d41-439b-a538-9777f71dd649"
+      }
+    },
+    "owner": "sanjeyasir"
+  }
+}
