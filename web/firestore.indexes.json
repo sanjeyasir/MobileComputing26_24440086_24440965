@@ -1,0 +1,21 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "cuts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "date", "order": "ASCENDING" },
+        { "fieldPath": "timestampMs", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "downtime",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "date", "order": "ASCENDING" },
+        { "fieldPath": "startMs", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

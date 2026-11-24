@@ -1,0 +1,6 @@
+{
+  "projects": {
+    "default": "msc-mobile-computing-project",
+    "prod": "msc-mobile-computing-project"
+  }
+}

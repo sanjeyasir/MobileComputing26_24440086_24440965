@@ -1,0 +1,480 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Rubberised Coir Cutter IoT API — Volume & Downtime Management",
+    "version": "3.0.0",
+    "description": "Production REST API for Toyo Cushion Lanka (Hayleys Eco Solutions Sector) Rubberised Coir Fleece Cutting Machine.\n\n### Core Rules:\n- **Cut Signal Ingestion (`POST /api/signal`)**: Only posts `1` (`{ \"post\": 1 }`). Count is captured on an hourly basis (1 post = 1 cut, not multiplied by two).\n- **Downtime Start (`POST /api/downtime/start`)**: Creates an active downtime log when a stoppage occurs.\n- **Downtime Monitor / Check (`GET /api/downtime/status`)**: Checks whether a downtime has been created / is currently active and returns downtime logs.\n- **Downtime End (`POST /api/downtime/end`)**: Ends and resolves the active downtime log with start/end timestamps and total downtime duration.",
+    "contact": {
+      "name": "Engineering & Maintenance Team",
+      "organization": "Toyo Cushion Lanka - Hayleys Eco Solutions Sector"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://api-auc2wpy33q-uc.a.run.app",
+      "description": "Direct Production Cloud Run URL"
+    },
+    {
+      "url": "https://msc-mobile-computing-project.web.app",
+      "description": "Firebase Hosting Proxy"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Cutter Volume Signals",
+      "description": "Post 1 signal ingestion (1 post = 1 cut, captured hourly)"
+    },
+    {
+      "name": "Downtime Management",
+      "description": "Create/start downtime, check/monitor downtime status, and end downtime"
+    },
+    {
+      "name": "Dashboard & Volume",
+      "description": "Hourly cut volume and downtime logs for Web & Mobile apps"
+    },
+    {
+      "name": "PDF Reports",
+      "description": "Single-page Hourly Cuts and Downtime Logs PDF report generation, download, and deletion"
+    },
+    {
+      "name": "Admin & System",
+      "description": "Health check and data reset operations"
+    }
+  ],
+  "paths": {
+    "/api/signal": {
+      "post": {
+        "tags": ["Cutter Volume Signals"],
+        "summary": "Post Cutter Signal (Post 1 = 1 Cut, Captured Hourly)",
+        "description": "Primary IoT & Web/Mobile signal endpoint. Accepts `{ \"post\": 1 }` and logs **1 cut** (`cutsAdded: 1`) in Sri Lanka Standard Time (SLST UTC+05:30), incrementing both the current hour's volume and today's total cut volume by 1.\n\n*Aliases: `/api/post`, `/api/cut`, `/api/arduino`*",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["post"],
+                "properties": {
+                  "post": {
+                    "type": "integer",
+                    "enum": [1],
+                    "description": "Signal value: always 1. Each post of 1 adds 1 cut to the hourly and daily volume.",
+                    "example": 1
+                  },
+                  "machineId": {
+                    "type": "string",
+                    "description": "Machine identifier",
+                    "default": "rubberised_coir_cutter",
+                    "example": "rubberised_coir_cutter"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "Optional ISO timestamp (defaults to current SLST server time)",
+                    "example": "2026-10-31T14:30:00+05:30"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Signal processed (+1 cut added to hourly & daily volume)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "integer", "example": 1 },
+                    "post": { "type": "integer", "example": 1 },
+                    "cutsAdded": { "type": "integer", "example": 2 },
+                    "hourlyVolume": { "type": "integer", "example": 24 },
+                    "totalCutsToday": { "type": "integer", "example": 120 },
+                    "timestamp": { "type": "string", "example": "2026-10-31T14:30:00+05:30" },
+                    "status": { "type": "string", "example": "Post 1 Signal Logged (+1 Cut Added)" },
+                    "id": { "type": "string", "example": "ceF0Q9dYX6ryM88Ygs7R" },
+                    "serverTime": { "type": "string", "example": "2026-10-31 14:30:00 (+05:30 SLST)" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Cutter Volume Signals"],
+        "summary": "Post Cutter Signal via GET (?post=1 -> +2 Cuts)",
+        "description": "Allows microcontrollers or simple clients to trigger a cut signal via `?post=1`. Counts as **1 cut**.",
+        "parameters": [
+          {
+            "name": "post",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "enum": [1], "default": 1 },
+            "description": "Signal value: 1 (adds 1 cut)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signal recorded (+1 cut added)"
+          }
+        }
+      }
+    },
+    "/api/downtime/start": {
+      "post": {
+        "tags": ["Downtime Management"],
+        "summary": "Create / Start a Downtime",
+        "description": "Creates a new active downtime record (`active: true`) when a machine stoppage occurs. Updates the machine status to `DOWNTIME` until `/api/downtime/end` is called to end the same downtime.\n\n*Aliases: `POST /api/downtime`, `POST /downtime/start`*",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "description": "Reason or note for the downtime",
+                    "example": "Blade Maintenance / Material Changeover"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "Origin of the downtime post (`web`, `mobile`, `api`)",
+                    "example": "web"
+                  },
+                  "startTime": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "Optional start timestamp (defaults to current SLST server time)"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Downtime created and marked ACTIVE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "status": { "type": "string", "example": "DOWNTIME" },
+                    "downtimeId": { "type": "string", "example": "dt_98a7bc65" },
+                    "downtime": {
+                      "type": "object",
+                      "properties": {
+                        "id": { "type": "string", "example": "dt_98a7bc65" },
+                        "active": { "type": "boolean", "example": true },
+                        "reason": { "type": "string", "example": "Blade Maintenance / Material Changeover" },
+                        "startTime": { "type": "string", "example": "2026-10-31T14:35:00+05:30" },
+                        "startTimeStr": { "type": "string", "example": "14:35:00" },
+                        "date": { "type": "string", "example": "2026-10-31" },
+                        "source": { "type": "string", "example": "web" }
+                      }
+                    },
+                    "message": { "type": "string", "example": "Downtime started and logged." }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/downtime/end": {
+      "post": {
+        "tags": ["Downtime Management"],
+        "summary": "End / Resolve Active Downtime",
+        "description": "Ends the active downtime record (`active: false`), records the end timestamp, calculates the downtime duration (`durationSeconds` and `durationMinutes`), and returns the machine status to `RUNNING`.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "downtimeId": {
+                    "type": "string",
+                    "description": "Optional specific downtime document ID to end (if omitted, ends the currently active downtime)",
+                    "example": "dt_98a7bc65"
+                  },
+                  "resolvedBy": {
+                    "type": "string",
+                    "description": "Optional note on who/what ended the downtime",
+                    "example": "Ended via Web App"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Active downtime ended and duration calculated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "status": { "type": "string", "example": "RUNNING" },
+                    "downtimeResolved": {
+                      "type": "object",
+                      "properties": {
+                        "downtimeId": { "type": "string", "example": "dt_98a7bc65" },
+                        "startTimeStr": { "type": "string", "example": "14:35:00" },
+                        "endTimeStr": { "type": "string", "example": "14:47:30" },
+                        "durationSeconds": { "type": "integer", "example": 750 },
+                        "durationMinutes": { "type": "number", "example": 12.5 },
+                        "reason": { "type": "string", "example": "Blade Maintenance / Material Changeover" }
+                      }
+                    },
+                    "resolvedAt": { "type": "string", "example": "2026-10-31 14:47:30 (+05:30 SLST)" },
+                    "message": { "type": "string", "example": "Downtime ended successfully at 14:47:30." }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/downtime/status": {
+      "get": {
+        "tags": ["Downtime Management"],
+        "summary": "Monitor & Check if Downtime Has Been Created (GET)",
+        "description": "Monitors and checks whether an active downtime currently exists (`hasActiveDowntime`), whether any downtime has been created on the selected date (`hasDowntimeCreatedToday`), and returns the active downtime details plus the full list of downtime logs.\n\n*Aliases: `GET /api/downtime`, `GET /api/downtime/check`*",
+        "parameters": [
+          {
+            "name": "date",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "format": "date", "example": "2026-10-31" },
+            "description": "Target date in YYYY-MM-DD format (defaults to today in SLST)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Downtime monitoring status and downtime logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "date": { "type": "string", "example": "2026-10-31" },
+                    "hasActiveDowntime": { "type": "boolean", "example": true },
+                    "hasDowntimeCreatedToday": { "type": "boolean", "example": true },
+                    "machineStatus": { "type": "string", "enum": ["RUNNING", "DOWNTIME"], "example": "DOWNTIME" },
+                    "activeDowntime": {
+                      "type": "object",
+                      "nullable": true,
+                      "properties": {
+                        "id": { "type": "string", "example": "dt_98a7bc65" },
+                        "active": { "type": "boolean", "example": true },
+                        "reason": { "type": "string", "example": "Blade Maintenance" },
+                        "startTime": { "type": "string", "example": "2026-10-31T14:35:00+05:30" },
+                        "startTimeStr": { "type": "string", "example": "14:35:00" },
+                        "elapsedSeconds": { "type": "integer", "example": 185 },
+                        "elapsedMinutes": { "type": "number", "example": 3.08 }
+                      }
+                    },
+                    "totalDowntimesCount": { "type": "integer", "example": 2 },
+                    "totalDowntimeMinutes": { "type": "number", "example": 15.5 },
+                    "downtimes": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": { "type": "string" },
+                          "active": { "type": "boolean" },
+                          "reason": { "type": "string" },
+                          "startTimeStr": { "type": "string" },
+                          "endTimeStr": { "type": "string", "nullable": true },
+                          "durationMinutes": { "type": "number", "nullable": true },
+                          "durationSeconds": { "type": "integer", "nullable": true }
+                        }
+                      }
+                    },
+                    "serverTimeSLST": { "type": "string", "example": "2026-10-31 14:38:05 (+05:30 SLST)" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/dashboard": {
+      "get": {
+        "tags": ["Dashboard & Volume"],
+        "summary": "Get Hourly Cut Volume & Downtime Logs",
+        "description": "Returns live machine status, today's total cut volume (`1 post = 1 cut`), 24-hour hourly volume array (`0-23h`), active downtime status, and downtime logs.",
+        "parameters": [
+          {
+            "name": "date",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "format": "date", "example": "2026-10-31" },
+            "description": "Target date in YYYY-MM-DD format (defaults to current date in SLST)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dashboard volume and downtime state"
+          }
+        }
+      }
+    },
+    "/api/reports/generate": {
+      "post": {
+        "tags": ["PDF Reports"],
+        "summary": "Generate Single-Page PDF Report (Hourly Cuts or Downtime Logs)",
+        "description": "Generates a clean 1-page PDF report. Type can be `hourly` (presents strictly the 24-hour hourly cuts) or `downtime` (presents all downtime incidents on one page).",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "date": {
+                    "type": "string",
+                    "format": "date",
+                    "description": "Target report date (YYYY-MM-DD).",
+                    "example": "2026-11-01"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["hourly", "downtime"],
+                    "description": "Type of PDF report to generate",
+                    "example": "hourly"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "PDF report generated and saved"
+          }
+        }
+      }
+    },
+    "/api/reports": {
+      "get": {
+        "tags": ["PDF Reports"],
+        "summary": "List Generated PDF Reports",
+        "description": "Retrieves list of generated PDF reports stored in Firestore.",
+        "responses": {
+          "200": { "description": "List of report records" }
+        }
+      }
+    },
+    "/api/reports/download/{id}": {
+      "get": {
+        "tags": ["PDF Reports"],
+        "summary": "Download / View PDF Report (.pdf)",
+        "description": "Direct binary streaming/download of the requested PDF report file.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Report Document ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "PDF file stream (.pdf)"
+          }
+        }
+      }
+    },
+    "/api/reports/{id}": {
+      "delete": {
+        "tags": ["PDF Reports"],
+        "summary": "Delete PDF Report",
+        "description": "Deletes a PDF report document from Firestore and removes the file from Firebase Storage.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Report Document ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Report deleted successfully"
+          }
+        }
+      }
+    },
+    "/api/admin/purge-all": {
+      "post": {
+        "tags": ["Admin & System"],
+        "summary": "Purge All Data & Reset Machine Baseline",
+        "description": "Clears all documents from `cuts`, `cutter_logs`, `downtime`, `daily_metrics`, archives, and resets machine state to 0 cuts.",
+        "responses": {
+          "200": {
+            "description": "Collections purged and baseline reset"
+          }
+        }
+      }
+    },
+    "/api/date": {
+      "get": {
+        "tags": ["Admin & System"],
+        "summary": "Get Current Date & Time (SLST)",
+        "description": "Returns the current server date (`YYYY-MM-DD`), time (`HH:MM:SS`), hour, ISO string, and timestamp in Sri Lanka Standard Time (`Asia/Colombo`, `UTC+05:30`).\n\n*Aliases: `GET /date`, `GET /api/current-date`, `GET /api/time`*",
+        "responses": {
+          "200": {
+            "description": "Current date and time in SLST",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean", "example": true },
+                    "date": { "type": "string", "format": "date", "example": "2026-11-01" },
+                    "currentDate": { "type": "string", "format": "date", "example": "2026-11-01" },
+                    "time": { "type": "string", "example": "04:55:00" },
+                    "hour": { "type": "integer", "example": 4 },
+                    "minute": { "type": "integer", "example": 55 },
+                    "second": { "type": "integer", "example": 0 },
+                    "iso": { "type": "string", "example": "2026-11-01T04:55:00+05:30" },
+                    "formatted": { "type": "string", "example": "2026-11-01 04:55:00 (+05:30 SLST)" },
+                    "timestampMs": { "type": "integer", "example": 1793489100000 },
+                    "timeZone": { "type": "string", "example": "Asia/Colombo (+05:30)" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/health": {
+      "get": {
+        "tags": ["Admin & System"],
+        "summary": "System Health & Server Time",
+        "description": "Verifies API uptime and returns current Sri Lanka Standard Time (Asia/Colombo UTC+05:30).",
+        "responses": {
+          "200": {
+            "description": "Health status"
+          }
+        }
+      }
+    }
+  }
+}
+

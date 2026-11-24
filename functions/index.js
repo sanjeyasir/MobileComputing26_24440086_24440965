@@ -11,10 +11,37 @@ const db = admin.firestore();
 db.settings({ ignoreUndefinedProperties: true });
 
 const MACHINE_ID = "rubberised_coir_cutter";
-const MACHINE_NAME = "Rubberised Coir Fleece Cutting machine";
+const MACHINE_NAME = "Rubberised Coir Fleece Cutting machine #1";
 const COMPANY_NAME = "Toyo Cushion Lanka";
 const SECTOR_NAME = "Hayleys Eco Solutions Sector";
-const CUTS_PER_POST = 2; // Every post of 1 counts as 2 cuts
+const CUTS_PER_POST = 1; // 1 post = 1 cut (captured on an hourly basis, not multiplied by two)
+
+const SUPPORTED_MACHINES = [
+  {
+    machineId: "rubberised_coir_cutter",
+    machineName: "Rubberised Coir Fleece Cutting Machine #1",
+    company: "Toyo Cushion Lanka",
+    sector: "Hayleys Eco Solutions Sector",
+    defaultMeterCount: 2.50,
+    defaultOrderNumber: ""
+  },
+  {
+    machineId: "coir_fleece_cutter_02",
+    machineName: "Rubberised Coir Fleece Cutting Machine #2",
+    company: "Toyo Cushion Lanka",
+    sector: "Hayleys Eco Solutions Sector",
+    defaultMeterCount: 2.00,
+    defaultOrderNumber: ""
+  },
+  {
+    machineId: "rotary_edge_trimmer",
+    machineName: "Rotary Fleece Edge Trimming Machine",
+    company: "Toyo Cushion Lanka",
+    sector: "Hayleys Eco Solutions Sector",
+    defaultMeterCount: 1.50,
+    defaultOrderNumber: ""
+  }
+];
 
 /**
  * Utility to calculate and format Sri Lanka Standard Time (Asia/Colombo, UTC+05:30)
@@ -56,10 +83,11 @@ function getSLSTDate(inputDate = new Date()) {
 
 /**
  * Compute Daily Volume & Downtime Metrics for a given date (YYYY-MM-DD)
- * - Each Post 1 signal = 2 cuts (CUTS_PER_POST = 2)
+ * - Each Post 1 signal = 1 cut (CUTS_PER_POST = 1, not multiplied by two)
+ * - Volume is captured on an hourly basis
  * - No cycle duration, idle threshold, availability, or OEE concepts
  */
-async function computeDailyMetrics(targetDateStr) {
+async function computeDailyMetrics(targetDateStr, targetMachineId = null) {
   const cutsSnap = await db
     .collection("cuts")
     .where("date", "==", targetDateStr)
@@ -70,16 +98,16 @@ async function computeDailyMetrics(targetDateStr) {
     .where("date", "==", targetDateStr)
     .get();
 
-  const cuts = [];
-  cutsSnap.forEach((d) => cuts.push({ id: d.id, ...d.data() }));
-  if (cuts.length === 0) {
+  const allCuts = [];
+  cutsSnap.forEach((d) => allCuts.push({ id: d.id, ...d.data() }));
+  if (allCuts.length === 0) {
     const archiveCutsSnap = await db
       .collection("cuts_archive")
       .where("date", "==", targetDateStr)
       .get();
-    archiveCutsSnap.forEach((d) => cuts.push({ id: d.id, ...d.data() }));
+    archiveCutsSnap.forEach((d) => allCuts.push({ id: d.id, ...d.data() }));
   }
-  cuts.sort((a, b) => (a.timestampMs || 0) - (b.timestampMs || 0));
+  allCuts.sort((a, b) => (a.timestampMs || 0) - (a.timestampMs || 0));
 
   const downtimes = [];
   downtimesSnap.forEach((d) => downtimes.push({ id: d.id, ...d.data() }));
@@ -90,10 +118,194 @@ async function computeDailyMetrics(targetDateStr) {
       .get();
     archiveDtSnap.forEach((d) => downtimes.push({ id: d.id, ...d.data() }));
   }
-  downtimes.sort((a, b) => (b.startMs || 0) - (a.startMs || 0));
+  downtimes.sort((a, b) => (a.startMs || 0) - (b.startMs || 0));
+
+  // Check if this is a Consolidated Fleet Report across all machines
+  if (targetMachineId === "all") {
+    let fleetTotalCuts = 0;
+    let fleetTotalLinearMeters = 0;
+    const fleetHourlyCuts = Array(24).fill(0);
+    const fleetHourlyLinearMeters = Array(24).fill(0);
+
+    const machinesBreakdown = await Promise.all(
+      SUPPORTED_MACHINES.map(async (def) => {
+        let machName = def.machineName;
+        let rate = def.defaultMeterCount;
+        let activeOrd = "";
+        let status = "RUNNING";
+
+        try {
+          const mDoc = await db.collection("machines").doc(def.machineId).get();
+          if (mDoc.exists) {
+            const md = mDoc.data();
+            if (md.machineName) machName = md.machineName;
+            if (md.meterCount !== undefined) rate = Number(md.meterCount);
+            // Strict date check: every day is a fresh set of orders; do not carry over from previous day
+            if (md.currentProductionOrder?.orderNumber) {
+              const ordDate = md.currentProductionOrder.date || (md.currentProductionOrder.updatedAt ? md.currentProductionOrder.updatedAt.slice(0, 10) : "");
+              if (ordDate === targetDateStr) {
+                activeOrd = String(md.currentProductionOrder.orderNumber).trim();
+              }
+            }
+            if (md.status) status = md.status;
+          }
+        } catch (e) { }
+
+        const machCuts = allCuts.filter(
+          (c) => c.machineId === def.machineId || (!c.machineId && def.machineId === "rubberised_coir_cutter")
+        );
+
+        const machDowntimes = downtimes.filter(
+          (dt) => dt.machineId === def.machineId || (!dt.machineId && def.machineId === "rubberised_coir_cutter")
+        );
+        let mDowntimeMins = 0;
+        machDowntimes.forEach((dt) => {
+          mDowntimeMins += Number(dt.durationMinutes || 0);
+        });
+
+        const hCuts = Array(24).fill(0);
+        let mTotalCuts = 0;
+        machCuts.forEach((c) => {
+          const h = Number(c.hour);
+          const cutsAdded = c.cutsAdded !== undefined ? Number(c.cutsAdded) : CUTS_PER_POST;
+          if (!isNaN(h) && h >= 0 && h < 24) {
+            hCuts[h] += cutsAdded;
+            fleetHourlyCuts[h] += cutsAdded;
+          }
+          mTotalCuts += cutsAdded;
+        });
+
+        const mLinearMeters = Number((mTotalCuts * rate).toFixed(2));
+        fleetTotalCuts += mTotalCuts;
+        fleetTotalLinearMeters += mLinearMeters;
+
+        for (let h = 0; h < 24; h++) {
+          fleetHourlyLinearMeters[h] += Number((hCuts[h] * rate).toFixed(2));
+        }
+
+        return {
+          machineId: def.machineId,
+          machineName: machName,
+          status,
+          meterCount: rate,
+          activeOrder: activeOrd,
+          totalCuts: mTotalCuts,
+          totalLinearMeters: mLinearMeters,
+          hourlyCuts: hCuts,
+          downtimeMinutes: parseFloat(mDowntimeMins.toFixed(2)),
+          downtimeCount: machDowntimes.length
+        };
+      })
+    );
+
+    const perHourDetails = Array.from({ length: 24 }).map((_, h) => ({
+      hour: h,
+      orderNumber: "Fleet Active",
+      cuts: fleetHourlyCuts[h],
+      meterCount: 0,
+      linearMeters: Number(fleetHourlyLinearMeters[h].toFixed(2))
+    }));
+
+    let totalDowntimeMinutes = 0;
+    downtimes.forEach((dt) => {
+      totalDowntimeMinutes += Number(dt.durationMinutes || 0);
+    });
+
+    return {
+      isFleetReport: true,
+      date: targetDateStr,
+      machineId: "all",
+      machineName: "All Monitored Machines (Consolidated Fleet Report)",
+      company: COMPANY_NAME,
+      sector: SECTOR_NAME,
+      cutsPerPost: CUTS_PER_POST,
+      totalCuts: fleetTotalCuts,
+      totalLinearMeters: Number(fleetTotalLinearMeters.toFixed(2)),
+      totalSignals: allCuts.length,
+      hourlyCuts: fleetHourlyCuts,
+      perHourDetails,
+      machinesBreakdown,
+      totalDowntimeMinutes: parseFloat(totalDowntimeMinutes.toFixed(2)),
+      downtimeIncidentsCount: downtimes.length,
+      hasActiveDowntime: downtimes.some((d) => d.active),
+      cutsList: allCuts,
+      downtimesList: downtimes
+    };
+  }
+
+  // Single machine metrics computation
+  const machineId = targetMachineId || MACHINE_ID;
+  const machDef = SUPPORTED_MACHINES.find((m) => m.machineId === machineId) || SUPPORTED_MACHINES[0];
+  let machineName = machDef.machineName;
+  let defaultMeterCount = machDef.defaultMeterCount || 2.50;
+  let activeOrder = ""; // No default order; must be explicitly provided from input
+
+  // Filter cuts for target machine
+  const cuts = allCuts.filter(
+    (c) => c.machineId === machineId || (!c.machineId && machineId === "rubberised_coir_cutter")
+  );
+
+  // Filter downtimes for target machine
+  const machDowntimes = targetMachineId === "all"
+    ? downtimes
+    : downtimes.filter(
+      (dt) => dt.machineId === machineId || (!dt.machineId && machineId === "rubberised_coir_cutter")
+    );
+
+  // Read machine doc for live status & master defaults
+  try {
+    const mDoc = await db.collection("machines").doc(machineId).get();
+    if (mDoc.exists) {
+      const md = mDoc.data();
+      if (md.machineName) machineName = md.machineName;
+      if (md.meterCount !== undefined) defaultMeterCount = Number(md.meterCount);
+      // Strict date check: fresh orders per day, never carry over from previous day
+      if (md.currentProductionOrder?.orderNumber) {
+        const ordDate = md.currentProductionOrder.date || (md.currentProductionOrder.updatedAt ? md.currentProductionOrder.updatedAt.slice(0, 10) : "");
+        if (ordDate === targetDateStr) {
+          activeOrder = String(md.currentProductionOrder.orderNumber).trim();
+        }
+      }
+    }
+  } catch (mErr) {
+    console.warn("Could not read machine doc:", mErr.message);
+  }
+
+  // Load 24-hour hourly production orders for this date and machine (rate is from machine master)
+  let hourlyPlans = Array.from({ length: 24 }).map((_, i) => ({
+    hour: i,
+    orderNumber: activeOrder || "",
+    meterCount: defaultMeterCount
+  }));
+
+  try {
+    const planSnap = await db.collection("daily_production_plan").doc(`${targetDateStr}_${machineId}`).get();
+    let hasPlan = false;
+    if (planSnap.exists && Array.isArray(planSnap.data().hourlyPlans)) {
+      const incoming = planSnap.data().hourlyPlans;
+      hourlyPlans = Array.from({ length: 24 }).map((_, i) => ({
+        hour: i,
+        orderNumber: incoming[i]?.orderNumber !== undefined ? String(incoming[i].orderNumber).trim() : "",
+        meterCount: defaultMeterCount
+      }));
+      hasPlan = true;
+    }
+    if (!hasPlan) {
+      const legacySnap = await db.collection("daily_production_plan").doc(targetDateStr).get();
+      if (legacySnap.exists && Array.isArray(legacySnap.data().hourlyPlans)) {
+        const incoming = legacySnap.data().hourlyPlans;
+        hourlyPlans = Array.from({ length: 24 }).map((_, i) => ({
+          hour: i,
+          orderNumber: incoming[i]?.orderNumber !== undefined ? String(incoming[i].orderNumber).trim() : "",
+          meterCount: defaultMeterCount
+        }));
+      }
+    }
+  } catch (pErr) {
+    console.warn("Could not read hourly plan:", pErr.message);
+  }
 
   // Hourly volume array for 24 hours: hour 0 to 23
-  // Every post of 1 counts as 2 cuts
   const hourlyCuts = Array(24).fill(0);
   const hourlySignals = Array(24).fill(0);
   let totalCuts = 0;
@@ -108,10 +320,31 @@ async function computeDailyMetrics(targetDateStr) {
     totalCuts += cutCount;
   });
 
+  // Calculate per-hour output & total linear meters
+  let totalLinearMeters = 0;
+  const perHourDetails = Array.from({ length: 24 }).map((_, h) => {
+    const hCuts = hourlyCuts[h] || 0;
+    const plan = hourlyPlans[h] || {};
+    const orderNum = plan.orderNumber !== undefined ? plan.orderNumber : activeOrder;
+    const rate = Number(plan.meterCount) || defaultMeterCount;
+    const produced = Number((hCuts * rate).toFixed(2));
+    totalLinearMeters += produced;
+    return {
+      hour: h,
+      orderNumber: orderNum || "",
+      cuts: hCuts,
+      signals: hourlySignals[h] || 0,
+      meterCount: rate,
+      linearMeters: produced
+    };
+  });
+
+  totalLinearMeters = Number(totalLinearMeters.toFixed(2));
+
   let totalDowntimeMinutes = 0;
   let activeDowntime = null;
 
-  downtimes.forEach((dt) => {
+  machDowntimes.forEach((dt) => {
     if (dt.active) {
       if (!activeDowntime) activeDowntime = dt;
       if (dt.startMs && !dt.endMs) {
@@ -128,37 +361,144 @@ async function computeDailyMetrics(targetDateStr) {
 
   return {
     date: targetDateStr,
-    machineId: MACHINE_ID,
-    machineName: MACHINE_NAME,
+    machineId,
+    machineName,
     company: COMPANY_NAME,
     sector: SECTOR_NAME,
     cutsPerPost: CUTS_PER_POST,
     totalCuts,
+    totalLinearMeters,
     totalSignals: cuts.length,
     totalCycles: cuts.length,
     hourlyCuts,
     hourlySignals,
+    perHourDetails,
+    hourlyPlans,
+    defaultMeterCount,
+    activeOrder,
     totalDowntimeMinutes,
-    downtimeIncidentsCount: downtimes.length,
+    downtimeIncidentsCount: machDowntimes.length,
     hasActiveDowntime: !!activeDowntime,
     activeDowntime,
     cutsList: cuts,
-    downtimesList: downtimes
+    downtimesList: machDowntimes
   };
 }
 
 /**
- * Generate Clean 1-Page PDF Buffer: Hourly Cut Volume Report (24h)
- * Strictly presents 24-hour hourly cuts, volume summary, and peak production.
+ * Generate Clean 1-Page PDF Buffer: Hourly Production & Cut Volume Report (24h)
+ * Displays machine, per-hour production order #, count of cuts, meter count rate, and linear meters output.
  */
 function generateHourlyCutsPdfBuffer(metrics, generatedTime = getSLSTDate()) {
   return new Promise((resolve, reject) => {
     const PDFDocument = require("pdfkit");
-    const doc = new PDFDocument({ size: "A4", margins: { top: 32, bottom: 32, left: 32, right: 32 } });
+    const doc = new PDFDocument({ size: "A4", margins: { top: 28, bottom: 28, left: 28, right: 28 } });
     const buffers = [];
     doc.on("data", buffers.push.bind(buffers));
     doc.on("end", () => resolve(Buffer.concat(buffers)));
     doc.on("error", reject);
+
+    if (metrics.isFleetReport) {
+      // Header banner for Fleet
+      doc.rect(28, 28, 539, 52).fill("#1e3a8a");
+      doc.fillColor("#fbbf24").fontSize(9).font("Helvetica-Bold")
+        .text("TOYO CUSHION LANKA (PVT) LTD • HAYLEYS ECO SOLUTIONS", 38, 38);
+      doc.fillColor("#ffffff").fontSize(15).font("Helvetica-Bold")
+        .text("CONSOLIDATED FLEET PRODUCTION REPORT", 38, 54);
+
+      doc.fillColor("#1e293b").fontSize(8.5).font("Helvetica-Bold")
+        .text("Equipment Fleet: All Monitored Cutting Lines (3 Machines)", 28, 88);
+      doc.font("Helvetica").fillColor("#64748b")
+        .text(`Report Date: ${metrics.date}  |  Generated (SLST): ${generatedTime.formatted}  |  Counting Rule: 1 Signal = 1 Cut`, 28, 100);
+
+      // Summary 4-box KPI row
+      const kpiY = 114;
+      const boxW = 128;
+      const gap = 9;
+
+      // KPI 1: Fleet Cuts
+      doc.rect(28, kpiY, boxW, 40).fillAndStroke("#ecfdf5", "#a7f3d0");
+      doc.fillColor("#065f46").fontSize(7.5).font("Helvetica-Bold").text("FLEET TOTAL CUTS", 36, kpiY + 6);
+      doc.fontSize(14).text(`${metrics.totalCuts.toLocaleString()} Cuts`, 36, kpiY + 18);
+
+      // KPI 2: Fleet Linear Output
+      doc.rect(28 + boxW + gap, kpiY, boxW, 40).fillAndStroke("#f0fdf4", "#86efac");
+      doc.fillColor("#166534").fontSize(7.5).font("Helvetica-Bold").text("FLEET LINEAR OUTPUT", 36 + boxW + gap, kpiY + 6);
+      doc.fontSize(14).text(`${Number(metrics.totalLinearMeters || 0).toFixed(2)} m`, 36 + boxW + gap, kpiY + 18);
+
+      // KPI 3: Monitored Lines
+      doc.rect(28 + (boxW + gap) * 2, kpiY, boxW, 40).fillAndStroke("#eff6ff", "#bfdbfe");
+      doc.fillColor("#1e40af").fontSize(7.5).font("Helvetica-Bold").text("ACTIVE FLEET LINES", 36 + (boxW + gap) * 2, kpiY + 6);
+      doc.fontSize(14).text(`${metrics.machinesBreakdown?.length || 3} Machines`, 36 + (boxW + gap) * 2, kpiY + 18);
+
+      // KPI 4: Total Downtime
+      doc.rect(28 + (boxW + gap) * 3, kpiY, boxW, 40).fillAndStroke("#fef2f2", "#fca5a5");
+      doc.fillColor("#991b1b").fontSize(7.5).font("Helvetica-Bold").text("FLEET DOWNTIME", 36 + (boxW + gap) * 3, kpiY + 6);
+      doc.fontSize(14).text(`${metrics.totalDowntimeMinutes || 0} mins`, 36 + (boxW + gap) * 3, kpiY + 18);
+
+      // Machine Breakdown Table
+      let cy = 164;
+      doc.rect(28, cy, 539, 18).fill("#1e293b");
+      doc.fillColor("#ffffff").fontSize(7.5).font("Helvetica-Bold");
+      doc.text("MACHINE / PRODUCTION LINE", 36, cy + 5);
+      doc.text("ACTIVE ORDER #", 210, cy + 5);
+      doc.text("STATUS", 305, cy + 5);
+      doc.text("CUTS", 375, cy + 5);
+      doc.text("FACTOR", 425, cy + 5);
+      doc.text("LINEAR OUTPUT", 480, cy + 5);
+      cy += 18;
+
+      const linesList = metrics.machinesBreakdown || [];
+      linesList.forEach((m, idx) => {
+        const bg = idx % 2 === 1 ? "#f8fafc" : "#ffffff";
+        doc.rect(28, cy, 539, 19).fill(bg);
+        doc.fillColor("#0f172a").fontSize(7.5).font("Helvetica-Bold").text(m.machineName, 36, cy + 5);
+        doc.fillColor("#0d6efd").font("Helvetica").text(m.activeOrder || "—", 210, cy + 5);
+        doc.fillColor(m.status === "DOWNTIME" ? "#dc2626" : "#166534").font("Helvetica-Bold").text(m.status, 305, cy + 5);
+        doc.fillColor("#047857").text(`${m.totalCuts} cuts`, 375, cy + 5);
+        doc.fillColor("#334155").font("Helvetica").text(`${m.meterCount.toFixed(2)} m/cut`, 425, cy + 5);
+        doc.fillColor("#166534").font("Helvetica-Bold").text(`${m.totalLinearMeters.toFixed(2)} m`, 480, cy + 5);
+        cy += 19;
+      });
+
+      // Machine Summary Total row
+      doc.rect(28, cy, 539, 19).fill("#e2e8f0");
+      doc.fillColor("#0f172a").fontSize(8).font("Helvetica-Bold").text("FLEET SUMMARY TOTAL", 36, cy + 5);
+      doc.fillColor("#047857").text(`${metrics.totalCuts} Cuts`, 375, cy + 5);
+      doc.fillColor("#166534").text(`${metrics.totalLinearMeters.toFixed(2)} m`, 480, cy + 5);
+      cy += 26;
+
+      // 24 Hour Fleet Hourly Distribution Section
+      doc.fillColor("#0f172a").fontSize(8.5).font("Helvetica-Bold").text("24-Hour Fleet Hourly Output Distribution (SLST)", 28, cy);
+      cy += 12;
+
+      doc.rect(28, cy, 539, 16).fill("#334155");
+      doc.fillColor("#ffffff").fontSize(7).font("Helvetica-Bold");
+      doc.text("HOUR WINDOW", 36, cy + 4);
+      doc.text("COMBINED FLEET CUTS", 220, cy + 4);
+      doc.text("COMBINED LINEAR OUTPUT (m)", 400, cy + 4);
+      cy += 16;
+
+      const perHour = metrics.perHourDetails || [];
+      const rowH = 17;
+      for (let h = 0; h < 24; h++) {
+        const row = perHour[h] || { hour: h, cuts: 0, linearMeters: 0 };
+        const bg = h % 2 === 1 ? "#f8fafc" : "#ffffff";
+        doc.rect(28, cy, 539, rowH).fill(bg);
+        doc.fillColor("#0f172a").fontSize(7).font("Helvetica");
+        doc.text(`${String(h).padStart(2, "0")}:00 - ${String((h + 1) % 24).padStart(2, "0")}:00`, 36, cy + 4);
+        doc.fillColor(row.cuts > 0 ? "#047857" : "#94a3b8").font(row.cuts > 0 ? "Helvetica-Bold" : "Helvetica").text(`${row.cuts} cuts`, 220, cy + 4);
+        doc.fillColor(row.linearMeters > 0 ? "#166534" : "#94a3b8").font(row.linearMeters > 0 ? "Helvetica-Bold" : "Helvetica").text(`${Number(row.linearMeters).toFixed(2)} m`, 400, cy + 4);
+        cy += rowH;
+      }
+
+      // Single-page Footer
+      doc.fillColor("#64748b").fontSize(7).font("Helvetica")
+        .text("Toyo Cushion Lanka (Pvt) Ltd • Hayleys Eco Solutions Sector • Consolidated Fleet Management Engine", 28, 804, { align: "center", width: 539 });
+
+      doc.end();
+      return;
+    }
 
     // Find Peak Hour
     let peakHour = 0;
@@ -171,68 +511,103 @@ function generateHourlyCutsPdfBuffer(metrics, generatedTime = getSLSTDate()) {
     });
 
     // Header banner
-    doc.rect(32, 32, 531, 54).fill("#064e3b");
+    doc.rect(28, 28, 539, 52).fill("#064e3b");
     doc.fillColor("#fbbf24").fontSize(9).font("Helvetica-Bold")
-       .text("TOYO CUSHION LANKA (PVT) LTD • HAYLEYS ECO SOLUTIONS", 44, 42);
-    doc.fillColor("#ffffff").fontSize(16).font("Helvetica-Bold")
-       .text("HOURLY CUT VOLUME REPORT", 44, 58);
+      .text("TOYO CUSHION LANKA (PVT) LTD • HAYLEYS ECO SOLUTIONS", 38, 38);
+    doc.fillColor("#ffffff").fontSize(15).font("Helvetica-Bold")
+      .text("HOURLY PRODUCTION & LINEAR METERS REPORT", 38, 54);
 
     doc.fillColor("#1e293b").fontSize(8.5).font("Helvetica-Bold")
-       .text(`Machine: ${MACHINE_NAME}`, 32, 96);
+      .text(`Machine: ${metrics.machineName || MACHINE_NAME} (${metrics.machineId || MACHINE_ID})`, 28, 88);
     doc.font("Helvetica").fillColor("#64748b")
-       .text(`Report Date: ${metrics.date}  |  Generated (SLST): ${generatedTime.formatted}  |  Counting Rule: 1 Post = 2 Cuts`, 32, 108);
+      .text(`Report Date: ${metrics.date}  |  Generated (SLST): ${generatedTime.formatted}  |  Counting Rule: 1 Signal = 1 Cut`, 28, 100);
 
-    // Summary 3-box KPI row
-    const kpiY = 124;
-    const boxW = 171;
+    // Summary 4-box KPI row
+    const kpiY = 114;
+    const boxW = 128;
+    const gap = 9;
 
-    // KPI 1: Total Volume
-    doc.rect(32, kpiY, boxW, 42).fillAndStroke("#ecfdf5", "#a7f3d0");
-    doc.fillColor("#065f46").fontSize(8).font("Helvetica-Bold").text("TOTAL CUT VOLUME", 42, kpiY + 6);
-    doc.fontSize(16).text(`${metrics.totalCuts.toLocaleString()} Cuts`, 42, kpiY + 18);
+    // KPI 1: Total Cuts
+    doc.rect(28, kpiY, boxW, 40).fillAndStroke("#ecfdf5", "#a7f3d0");
+    doc.fillColor("#065f46").fontSize(7.5).font("Helvetica-Bold").text("TOTAL CUTS TODAY", 36, kpiY + 6);
+    doc.fontSize(14).text(`${metrics.totalCuts.toLocaleString()} Cuts`, 36, kpiY + 18);
 
-    // KPI 2: Peak Hour
-    doc.rect(212, kpiY, boxW, 42).fillAndStroke("#eff6ff", "#bfdbfe");
-    doc.fillColor("#1e40af").fontSize(8).font("Helvetica-Bold").text("PEAK PRODUCTION HOUR", 222, kpiY + 6);
-    doc.fontSize(11).text(peakCount > 0 ? `${String(peakHour).padStart(2, "0")}:00 - ${String((peakHour + 1) % 24).padStart(2, "0")}:00 (${peakCount} cuts)` : "No cuts recorded", 222, kpiY + 20);
+    // KPI 2: Total Linear Output
+    doc.rect(28 + boxW + gap, kpiY, boxW, 40).fillAndStroke("#f0fdf4", "#86efac");
+    doc.fillColor("#166534").fontSize(7.5).font("Helvetica-Bold").text("TOTAL LINEAR OUTPUT", 36 + boxW + gap, kpiY + 6);
+    doc.fontSize(14).text(`${Number(metrics.totalLinearMeters || 0).toFixed(2)} m`, 36 + boxW + gap, kpiY + 18);
 
-    // KPI 3: Machine Status
-    doc.rect(392, kpiY, boxW, 42).fillAndStroke(metrics.hasActiveDowntime ? "#fef2f2" : "#f0fdf4", metrics.hasActiveDowntime ? "#f87171" : "#86efac");
-    doc.fillColor(metrics.hasActiveDowntime ? "#dc2626" : "#166534").fontSize(8).font("Helvetica-Bold").text("MACHINE STATUS", 402, kpiY + 6);
-    doc.fontSize(12).text(metrics.hasActiveDowntime ? "⚠️ DOWNTIME ACTIVE" : "✓ MACHINE RUNNING", 402, kpiY + 20);
+    // KPI 3: Peak Hour
+    doc.rect(28 + (boxW + gap) * 2, kpiY, boxW, 40).fillAndStroke("#eff6ff", "#bfdbfe");
+    doc.fillColor("#1e40af").fontSize(7.5).font("Helvetica-Bold").text("PEAK PRODUCTION HOUR", 36 + (boxW + gap) * 2, kpiY + 6);
+    doc.fontSize(9.5).text(peakCount > 0 ? `${String(peakHour).padStart(2, "0")}:00 (${peakCount} cuts)` : "No cuts yet", 36 + (boxW + gap) * 2, kpiY + 19);
 
-    // 24 Hour Hourly Cuts Table (Strictly: Hour Window and Count of Cuts)
-    const tableTop = 176;
-    const rowH = 22.5;
-    doc.rect(32, tableTop, 531, 20).fill("#1e293b");
-    doc.fillColor("#ffffff").fontSize(9).font("Helvetica-Bold");
-    doc.text("HOUR WINDOW (SLST)", 50, tableTop + 6);
-    doc.text("COUNT OF CUTS PER HOUR", 320, tableTop + 6);
+    // KPI 4: Machine Status
+    doc.rect(28 + (boxW + gap) * 3, kpiY, boxW, 40).fillAndStroke(metrics.hasActiveDowntime ? "#fef2f2" : "#f8fafc", metrics.hasActiveDowntime ? "#f87171" : "#cbd5e1");
+    doc.fillColor(metrics.hasActiveDowntime ? "#dc2626" : "#334155").fontSize(7.5).font("Helvetica-Bold").text("MACHINE STATUS", 36 + (boxW + gap) * 3, kpiY + 6);
+    doc.fontSize(10.5).text(metrics.hasActiveDowntime ? "⚠️ DOWNTIME" : "● RUNNING", 36 + (boxW + gap) * 3, kpiY + 19);
+
+    // 24 Hour Detailed Production Table
+    const tableTop = 162;
+    const rowH = 22;
+    doc.rect(28, tableTop, 539, 20).fill("#1e293b");
+    doc.fillColor("#ffffff").fontSize(8).font("Helvetica-Bold");
+    doc.text("HOUR WINDOW (SLST)", 36, tableTop + 6);
+    doc.text("ORDER #", 155, tableTop + 6);
+    doc.text("CUTS (POST API)", 265, tableTop + 6);
+    doc.text("RATE (m/cut)", 375, tableTop + 6);
+    doc.text("LINEAR OUTPUT (m)", 460, tableTop + 6);
 
     let cy = tableTop + 20;
+    const perHour = metrics.perHourDetails || [];
+
     for (let h = 0; h < 24; h++) {
-      const cuts = metrics.hourlyCuts[h] || 0;
+      const row = perHour[h] || { hour: h, cuts: metrics.hourlyCuts[h] || 0, orderNumber: metrics.activeOrder, meterCount: metrics.defaultMeterCount, linearMeters: 0 };
       const isAlt = h % 2 === 1;
-      const isPeak = cuts > 0 && cuts === peakCount;
-      const rowBg = isPeak ? "#d1fae5" : (cuts > 0 ? (isAlt ? "#ecfdf5" : "#ffffff") : (isAlt ? "#f8fafc" : "#ffffff"));
+      const isPeak = row.cuts > 0 && row.cuts === peakCount;
+      const rowBg = isPeak ? "#d1fae5" : (row.cuts > 0 ? (isAlt ? "#ecfdf5" : "#ffffff") : (isAlt ? "#f8fafc" : "#ffffff"));
 
-      doc.rect(32, cy, 531, rowH).fill(rowBg);
-      doc.fillColor("#0f172a").fontSize(8.5).font("Helvetica");
-      doc.text(`${String(h).padStart(2, "0")}:00 - ${String((h + 1) % 24).padStart(2, "0")}:00`, 50, cy + 6);
+      doc.rect(28, cy, 539, rowH).fill(rowBg);
+      doc.fillColor("#0f172a").fontSize(8).font("Helvetica");
+      doc.text(`${String(h).padStart(2, "0")}:00 - ${String((h + 1) % 24).padStart(2, "0")}:00`, 36, cy + 6);
 
-      if (cuts > 0) {
-        doc.fillColor("#047857").font("Helvetica-Bold").text(`${cuts} Cuts ${isPeak ? "★ (Peak Hour)" : ""}`, 320, cy + 6);
+      // Order #
+      doc.fillColor("#0d6efd").font("Helvetica-Bold").text(row.orderNumber ? String(row.orderNumber) : "—", 155, cy + 6);
+
+      // Cuts
+      if (row.cuts > 0) {
+        doc.fillColor("#047857").font("Helvetica-Bold").text(`${row.cuts} cuts ${isPeak ? "★" : ""}`, 265, cy + 6);
       } else {
-        doc.fillColor("#94a3b8").font("Helvetica").text("0 Cuts", 320, cy + 6);
+        doc.fillColor("#94a3b8").font("Helvetica").text("0 cuts", 265, cy + 6);
+      }
+
+      // Rate
+      doc.fillColor("#334155").font("Helvetica").text(`${Number(row.meterCount || 2.50).toFixed(2)} m`, 375, cy + 6);
+
+      // Linear Output
+      if (row.linearMeters > 0) {
+        doc.fillColor("#166534").font("Helvetica-Bold").text(`${Number(row.linearMeters).toFixed(2)} m`, 460, cy + 6);
+      } else {
+        doc.fillColor("#94a3b8").font("Helvetica").text("0.00 m", 460, cy + 6);
       }
 
       cy += rowH;
     }
-    doc.rect(32, tableTop, 531, 20 + 24 * rowH).stroke("#cbd5e1");
+
+    // Table Summary Footer Row
+    doc.rect(28, cy, 539, 22).fill("#e2e8f0");
+    doc.fillColor("#0f172a").fontSize(8.5).font("Helvetica-Bold");
+    doc.text("DAILY TOTAL (24 HOURS)", 36, cy + 6);
+    doc.text(`${metrics.machineId || "MACHINE"}`, 155, cy + 6);
+    doc.fillColor("#047857").text(`${metrics.totalCuts} Cuts`, 265, cy + 6);
+    doc.fillColor("#334155").text(`-`, 375, cy + 6);
+    doc.fillColor("#166534").text(`${Number(metrics.totalLinearMeters || 0).toFixed(2)} m`, 460, cy + 6);
+
+    doc.rect(28, tableTop, 539, 20 + 25 * rowH).stroke("#cbd5e1");
 
     // Single-page Footer
     doc.fillColor("#64748b").fontSize(7).font("Helvetica")
-       .text("Toyo Cushion Lanka (Pvt) Ltd • Hayleys Eco Solutions Sector • MSc Mobile Computing Project Telemetry Engine", 32, 792, { align: "center", width: 531 });
+      .text("Toyo Cushion Lanka (Pvt) Ltd • Hayleys Eco Solutions Sector • MSc Mobile Computing Project Telemetry Engine", 28, 804, { align: "center", width: 539 });
 
     doc.end();
   });
@@ -256,14 +631,14 @@ function generateDowntimeLogsPdfBuffer(metrics, generatedTime = getSLSTDate()) {
     // Header banner
     doc.rect(32, 32, 531, 54).fill("#7f1d1d");
     doc.fillColor("#fde68a").fontSize(9).font("Helvetica-Bold")
-       .text("TOYO CUSHION LANKA (PVT) LTD • HAYLEYS ECO SOLUTIONS", 44, 42);
+      .text("TOYO CUSHION LANKA (PVT) LTD • HAYLEYS ECO SOLUTIONS", 44, 42);
     doc.fillColor("#ffffff").fontSize(16).font("Helvetica-Bold")
-       .text("MACHINE DOWNTIME INCIDENTS & LOGS REPORT", 44, 58);
+      .text(metrics.isFleetReport ? "CONSOLIDATED FLEET DOWNTIME REPORT" : "MACHINE DOWNTIME INCIDENTS & LOGS REPORT", 44, 58);
 
     doc.fillColor("#1e293b").fontSize(8.5).font("Helvetica-Bold")
-       .text(`Machine: ${MACHINE_NAME}`, 32, 96);
+      .text(`Machine: ${metrics.machineName || MACHINE_NAME}`, 32, 96);
     doc.font("Helvetica").fillColor("#64748b")
-       .text(`Report Date: ${metrics.date}  |  Generated (SLST): ${generatedTime.formatted}  |  Total Incidents: ${downtimes.length}`, 32, 108);
+      .text(`Report Date: ${metrics.date}  |  Generated (SLST): ${generatedTime.formatted}  |  Total Incidents: ${downtimes.length}`, 32, 108);
 
     // Summary 3-box KPI row
     const kpiY = 124;
@@ -300,9 +675,9 @@ function generateDowntimeLogsPdfBuffer(metrics, generatedTime = getSLSTDate()) {
     if (downtimes.length === 0) {
       doc.rect(32, cy, 531, 80).fill("#f8fafc");
       doc.fillColor("#15803d").fontSize(11).font("Helvetica-Bold")
-         .text("✓ No downtime incidents recorded on this date.", 32, cy + 26, { align: "center", width: 531 });
+        .text("✓ No downtime incidents recorded on this date.", 32, cy + 26, { align: "center", width: 531 });
       doc.fillColor("#64748b").fontSize(8.5).font("Helvetica")
-         .text("The Rubberised Coir Cutting Machine operated without any recorded stoppages.", 32, cy + 44, { align: "center", width: 531 });
+        .text(`${metrics.machineName || "The monitored equipment"} operated without any recorded stoppages.`, 32, cy + 44, { align: "center", width: 531 });
       cy += 80;
     } else {
       const maxRows = 24; // Ensure clean single page
@@ -314,8 +689,12 @@ function generateDowntimeLogsPdfBuffer(metrics, generatedTime = getSLSTDate()) {
         const rowBg = dt.active ? "#fee2e2" : (isAlt ? "#f8fafc" : "#ffffff");
         doc.rect(32, cy, 531, rowH).fill(rowBg);
 
+        const desc = metrics.isFleetReport && dt.machineId
+          ? `[${dt.machineId}] ${dt.reason || "Downtime"}`
+          : (dt.reason || "Machine Downtime");
+
         doc.fillColor("#475569").fontSize(7.5).font("Helvetica").text(String(idx + 1), 38, cy + 6);
-        doc.fillColor("#0f172a").font("Helvetica-Bold").text(dt.reason || "Machine Downtime", 56, cy + 6, { width: 155, ellipsis: true });
+        doc.fillColor("#0f172a").font("Helvetica-Bold").text(desc, 56, cy + 6, { width: 155, ellipsis: true });
         doc.font("Helvetica").fillColor("#334155").text(dt.startTimeStr || dt.startTime || "—", 220, cy + 6);
         doc.text(dt.active ? "Ongoing..." : (dt.endTimeStr || dt.endTime || "—"), 320, cy + 6);
 
@@ -339,7 +718,7 @@ function generateDowntimeLogsPdfBuffer(metrics, generatedTime = getSLSTDate()) {
 
     // Single-page Footer
     doc.fillColor("#64748b").fontSize(7).font("Helvetica")
-       .text("Toyo Cushion Lanka (Pvt) Ltd • Hayleys Eco Solutions Sector • MSc Mobile Computing Project Telemetry Engine", 32, 792, { align: "center", width: 531 });
+      .text("Toyo Cushion Lanka (Pvt) Ltd • Hayleys Eco Solutions Sector • MSc Mobile Computing Project Telemetry Engine", 32, 792, { align: "center", width: 531 });
 
     doc.end();
   });
@@ -400,9 +779,9 @@ async function uploadReportToFirebaseStorage(fileName, buffer, mimeType = "appli
 /**
  * Execute PDF Report Pipeline, Upload to Firebase Storage & Save to Firestore
  */
-async function executeDailyPdfReportPipeline(targetDateStr, reportType = "hourly") {
+async function executeDailyPdfReportPipeline(targetDateStr, reportType = "hourly", targetMachineId = null) {
   const slstTime = getSLSTDate();
-  const metrics = await computeDailyMetrics(targetDateStr);
+  const metrics = await computeDailyMetrics(targetDateStr, targetMachineId);
   const isDowntime = String(reportType).toLowerCase() === "downtime";
 
   let pdfBuffer;
@@ -411,24 +790,35 @@ async function executeDailyPdfReportPipeline(targetDateStr, reportType = "hourly
 
   if (isDowntime) {
     pdfBuffer = await generateDowntimeLogsPdfBuffer(metrics, slstTime);
-    fileName = `ToyoCushion_DowntimeLogs_${targetDateStr}_${slstTime.fileStamp}.pdf`;
-    title = `Downtime Logs Report (${targetDateStr})`;
+    if (metrics.isFleetReport) {
+      fileName = `ToyoCushion_FleetDowntime_${targetDateStr}_${slstTime.fileStamp}.pdf`;
+      title = `Consolidated Fleet Downtime Report (${targetDateStr})`;
+    } else {
+      fileName = `ToyoCushion_DowntimeLogs_${metrics.machineId}_${targetDateStr}_${slstTime.fileStamp}.pdf`;
+      title = `Downtime Logs Report (${metrics.machineName} - ${targetDateStr})`;
+    }
   } else {
     pdfBuffer = await generateHourlyCutsPdfBuffer(metrics, slstTime);
-    fileName = `ToyoCushion_HourlyCuts_${targetDateStr}_${slstTime.fileStamp}.pdf`;
-    title = `Hourly Cut Volume Report (${targetDateStr})`;
+    if (metrics.isFleetReport) {
+      fileName = `ToyoCushion_FleetProduction_${targetDateStr}_${slstTime.fileStamp}.pdf`;
+      title = `Consolidated Fleet Production Report (${targetDateStr})`;
+    } else {
+      fileName = `ToyoCushion_HourlyProduction_${metrics.machineId}_${targetDateStr}_${slstTime.fileStamp}.pdf`;
+      title = `Hourly Production Report (${metrics.machineName} - ${targetDateStr})`;
+    }
   }
 
   const base64Data = pdfBuffer.toString("base64");
   const storageResult = await uploadReportToFirebaseStorage(fileName, pdfBuffer, "application/pdf");
 
-  await db.collection("daily_metrics").doc(targetDateStr).set({
+  await db.collection("daily_metrics").doc(`${targetDateStr}_${metrics.machineId}`).set({
     date: targetDateStr,
-    machineId: MACHINE_ID,
-    machineName: MACHINE_NAME,
+    machineId: metrics.machineId,
+    machineName: metrics.machineName,
     company: COMPANY_NAME,
     sector: SECTOR_NAME,
     totalCuts: metrics.totalCuts,
+    totalLinearMeters: metrics.totalLinearMeters || 0,
     totalSignals: metrics.totalSignals,
     totalCycles: metrics.totalCycles,
     hourlyCuts: metrics.hourlyCuts,
@@ -438,14 +828,14 @@ async function executeDailyPdfReportPipeline(targetDateStr, reportType = "hourly
   }, { merge: true });
 
   const reportDoc = {
-    reportId: `REP-${isDowntime ? "DOWNTIME" : "HOURLY"}-${targetDateStr}-${slstTime.fileStamp}`,
+    reportId: `REP-${isDowntime ? "DOWNTIME" : "HOURLY"}-${metrics.machineId}-${targetDateStr}-${slstTime.fileStamp}`,
     date: targetDateStr,
     reportType: isDowntime ? "downtime" : "hourly",
     title,
     fileName,
     format: "pdf",
-    machineId: MACHINE_ID,
-    machineName: MACHINE_NAME,
+    machineId: metrics.machineId,
+    machineName: metrics.machineName,
     company: COMPANY_NAME,
     sector: SECTOR_NAME,
     createdAt: slstTime.iso,
@@ -456,6 +846,7 @@ async function executeDailyPdfReportPipeline(targetDateStr, reportType = "hourly
     storageUrl: storageResult.publicUrl || null,
     metrics: {
       totalCuts: metrics.totalCuts,
+      totalLinearMeters: metrics.totalLinearMeters || 0,
       totalSignals: metrics.totalSignals,
       totalCycles: metrics.totalCycles,
       totalDowntimeMinutes: metrics.totalDowntimeMinutes,
@@ -507,7 +898,7 @@ async function deleteReportPipeline(reportId) {
       try {
         await admin.storage().bucket(bName).file(reportData.storagePath).delete({ ignoreNotFound: true });
         break;
-      } catch (err) {}
+      } catch (err) { }
     }
   }
 
@@ -595,73 +986,21 @@ async function archiveAndRotateDailyData(targetDateStr) {
 }
 
 /**
- * Delete data from the archive list every Monday at 2am, WITHOUT eliminating the previous day's details.
+ * Archive Retention Policy: Permanent Retention.
+ * Archived records in `cuts_archive` and `downtime_archive` are retained permanently without deletion.
  */
 async function purgeOldArchiveDataWithoutEliminatingPreviousDay() {
   const slstNow = getSLSTDate();
-  const prevDayDate = new Date(slstNow.date.getTime() - 24 * 60 * 60 * 1000);
-  const previousDayStr = getSLSTDate(prevDayDate).dateString;
-
-  const cutsArchiveSnap = await db
-    .collection("cuts_archive")
-    .where("date", "<", previousDayStr)
-    .get();
-
-  let purgedCuts = 0;
-  if (!cutsArchiveSnap.empty) {
-    const batches = [];
-    let currentBatch = db.batch();
-    let opCount = 0;
-
-    cutsArchiveSnap.forEach((doc) => {
-      currentBatch.delete(doc.ref);
-      opCount++;
-      purgedCuts++;
-      if (opCount >= 450) {
-        batches.push(currentBatch.commit());
-        currentBatch = db.batch();
-        opCount = 0;
-      }
-    });
-
-    if (opCount > 0) batches.push(currentBatch.commit());
-    await Promise.all(batches);
-  }
-
-  const dtArchiveSnap = await db
-    .collection("downtime_archive")
-    .where("date", "<", previousDayStr)
-    .get();
-
-  let purgedDowntimes = 0;
-  if (!dtArchiveSnap.empty) {
-    const batches = [];
-    let currentBatch = db.batch();
-    let opCount = 0;
-
-    dtArchiveSnap.forEach((doc) => {
-      currentBatch.delete(doc.ref);
-      opCount++;
-      purgedDowntimes++;
-      if (opCount >= 450) {
-        batches.push(currentBatch.commit());
-        currentBatch = db.batch();
-        opCount = 0;
-      }
-    });
-
-    if (opCount > 0) batches.push(currentBatch.commit());
-    await Promise.all(batches);
-  }
+  console.log(`[Archive Retention Policy] Permanent retention active. All historical records in 'cuts_archive' and 'downtime_archive' are preserved indefinitely.`);
 
   const result = {
-    action: "weekly_monday_archive_purge",
+    action: "archive_retention_policy",
     executedAt: slstNow.iso,
     executedAtFormatted: slstNow.formatted,
-    protectedPreviousDay: previousDayStr,
-    purgedCutRecordsCount: purgedCuts,
-    purgedDowntimeRecordsCount: purgedDowntimes,
-    status: "SUCCESS"
+    policy: "PERMANENT_RETENTION",
+    purgedCutRecordsCount: 0,
+    purgedDowntimeRecordsCount: 0,
+    status: "PRESERVED_PERMANENTLY"
   };
 
   await db.collection("audit_logs").add(result);
@@ -728,7 +1067,8 @@ const openApiSpec = {
     description:
       "Production REST API for Toyo Cushion Lanka (Hayleys Eco Solutions Sector) Rubberised Coir Fleece Cutting Machine.\n\n" +
       "### Core Rules:\n" +
-      "- **Cut Signal Ingestion (`POST /api/signal`)**: Only posts `1` (`{ \"post\": 1 }`). Every post of `1` is counted as **2 cuts** (`cutsAdded = 2`) toward hourly and daily volume.\n" +
+      "- **Cut Signal Ingestion (`POST /api/signal`)**: Only posts `1` (`{ \"post\": 1 }`). Count is captured on an hourly basis (1 post = 1 cut, not multiplied by two).\n" +
+      "- **Production Order Management (`/api/production-order`)**: Sets and tracks Production Order Number and Linear Meters required for the hour, multiplied by post API cut count.\n" +
       "- **Downtime Start (`POST /api/downtime/start`)**: Creates an active downtime log when a stoppage occurs.\n" +
       "- **Downtime Monitor / Check (`GET /api/downtime/status`)**: Checks whether a downtime has been created / is currently active and returns downtime logs.\n" +
       "- **Downtime End (`POST /api/downtime/end`)**: Ends and resolves the active downtime log with start/end timestamps and total downtime duration.",
@@ -748,7 +1088,8 @@ const openApiSpec = {
     }
   ],
   tags: [
-    { name: "Cutter Volume Signals", description: "Post 1 signal ingestion (1 post = 2 cuts)" },
+    { name: "Cutter Volume Signals", description: "Post 1 signal ingestion (1 post = 1 cut, captured hourly)" },
+    { name: "Production Order", description: "Production order number and hourly linear meters calculation" },
     { name: "Downtime Management", description: "Create/start downtime, check/monitor downtime status, and end downtime" },
     { name: "Dashboard & Volume", description: "Hourly cut volume and downtime logs for Web & Mobile apps" },
     { name: "PDF Reports", description: "Single-page Hourly Cuts and Downtime Logs PDF report generation, download, and deletion" },
@@ -758,9 +1099,9 @@ const openApiSpec = {
     "/api/signal": {
       post: {
         tags: ["Cutter Volume Signals"],
-        summary: "Post Cutter Signal (Post 1 = 2 Cuts)",
+        summary: "Post Cutter Signal (Post 1 = 1 Cut, Captured Hourly)",
         description:
-          "Primary IoT & Web/Mobile signal endpoint. Accepts `{ \"post\": 1 }` and logs **2 cuts** (`cutsAdded: 2`) in Sri Lanka Standard Time (SLST UTC+05:30), incrementing both the current hour's volume and today's total cut volume by 2.\n\n*Aliases: `/api/post`, `/api/cut`, `/api/arduino`*",
+          "Primary IoT & Web/Mobile signal endpoint. Accepts `{ \"post\": 1 }` and logs **1 cut** (`cutsAdded: 1`) in Sri Lanka Standard Time (SLST UTC+05:30), incrementing both the current hour's volume and today's total cut volume by 1. Also computes linear meters produced when an active production order is configured.\n\n*Aliases: `/api/post`, `/api/cut`, `/api/arduino`*",
         requestBody: {
           required: true,
           content: {
@@ -772,7 +1113,7 @@ const openApiSpec = {
                   post: {
                     type: "integer",
                     enum: [1],
-                    description: "Signal value: always 1. Each post of 1 adds 2 cuts to the hourly and daily volume.",
+                    description: "Signal value: always 1. Each post of 1 adds 1 cut to the hourly and daily volume.",
                     example: 1
                   },
                   machineId: {
@@ -794,7 +1135,7 @@ const openApiSpec = {
         },
         responses: {
           "200": {
-            description: "Signal processed (+2 cuts added to hourly & daily volume)",
+            description: "Signal processed (+1 cut added to hourly & daily volume)",
             content: {
               "application/json": {
                 schema: {
@@ -802,11 +1143,15 @@ const openApiSpec = {
                   properties: {
                     ok: { type: "integer", example: 1 },
                     post: { type: "integer", example: 1 },
-                    cutsAdded: { type: "integer", example: 2 },
+                    cutsAdded: { type: "integer", example: 1 },
                     hourlyVolume: { type: "integer", example: 24 },
                     totalCutsToday: { type: "integer", example: 120 },
+                    productionOrder: { type: "string", example: "PO-2026-001" },
+                    linearMetersPerHour: { type: "number", example: 2.5 },
+                    hourlyLinearMeters: { type: "number", example: 60.0 },
+                    totalLinearMetersToday: { type: "number", example: 300.0 },
                     timestamp: { type: "string", example: "2026-10-31T14:30:00+05:30" },
-                    status: { type: "string", example: "Post 1 Signal Logged (+2 Cuts Added)" },
+                    status: { type: "string", example: "Post 1 Signal Logged (+1 Cut Added)" },
                     id: { type: "string", example: "ceF0Q9dYX6ryM88Ygs7R" },
                     serverTime: { type: "string", example: "2026-10-31 14:30:00 (+05:30 SLST)" }
                   }
@@ -1276,7 +1621,7 @@ app.get(
 /**
  * Helper to resolve and finalize active downtime when ended via Web/Mobile UI or API
  */
-async function resolveActiveDowntimeIfAny(machineData, slst, resolvedByText, specificDtId) {
+async function resolveActiveDowntimeIfAny(machineData, slst, resolvedByText, specificDtId, targetMachineId = null) {
   const dtId = specificDtId || machineData?.currentDowntimeId || machineData?.activeDowntime?.id;
   if (dtId) {
     const dtRef = db.collection("downtime").doc(dtId);
@@ -1305,6 +1650,8 @@ async function resolveActiveDowntimeIfAny(machineData, slst, resolvedByText, spe
 
       return {
         downtimeId: dtId,
+        machineId: dtData.machineId || targetMachineId || MACHINE_ID,
+        machineName: dtData.machineName || MACHINE_NAME,
         reason: dtData.reason || "Machine Downtime",
         startTime: dtData.startTime,
         startTimeStr: dtData.startTimeStr,
@@ -1317,9 +1664,13 @@ async function resolveActiveDowntimeIfAny(machineData, slst, resolvedByText, spe
     }
   }
 
-  // Fallback: check if any active downtime exists in the downtime collection
+  // Fallback: check if any active downtime exists for targetMachineId
   try {
-    const activeSnap = await db.collection("downtime").where("active", "==", true).get();
+    let queryRef = db.collection("downtime").where("active", "==", true);
+    if (targetMachineId) {
+      queryRef = queryRef.where("machineId", "==", targetMachineId);
+    }
+    const activeSnap = await queryRef.get();
     if (!activeSnap.empty) {
       let resolvedItem = null;
       for (const doc of activeSnap.docs) {
@@ -1346,6 +1697,8 @@ async function resolveActiveDowntimeIfAny(machineData, slst, resolvedByText, spe
 
         resolvedItem = {
           downtimeId: doc.id,
+          machineId: dtData.machineId || targetMachineId || MACHINE_ID,
+          machineName: dtData.machineName || MACHINE_NAME,
           reason: dtData.reason || "Machine Downtime",
           startTime: dtData.startTime,
           startTimeStr: dtData.startTimeStr,
@@ -1368,7 +1721,7 @@ async function resolveActiveDowntimeIfAny(machineData, slst, resolvedByText, spe
 /**
  * Unified Cutter Signal & Volume Ingestion Endpoint
  * - The API only posts `1` (`{ "post": 1 }` or `?post=1`).
- * - Whenever `1` is posted, it is counted as 2 cuts (`cutsAdded = 2`).
+ * - Whenever `1` is posted, it is counted as 1 cut (captured on an hourly basis, not multiplied by two).
  * - Time-taken / cycle duration / idle threshold concepts are retired.
  */
 app.all(
@@ -1388,22 +1741,55 @@ app.all(
     try {
       const params = { ...(req.query || {}), ...(req.body || {}) };
       const postValue = 1;
-      const cutsAdded = CUTS_PER_POST; // 1 post = 2 cuts
+      const cutsAdded = CUTS_PER_POST; // 1 post = 1 cut (captured on an hourly basis, not multiplied by two)
 
+      const targetMachineId = params.machineId || params.machine || MACHINE_ID;
       const slst = getSLSTDate(params.timestamp || new Date());
       const currentMs = slst.timestampMs;
 
-      const machineRef = db.collection("machines").doc(MACHINE_ID);
+      const machineRef = db.collection("machines").doc(targetMachineId);
       const machineDoc = await machineRef.get();
       const machineData = machineDoc.exists ? machineDoc.data() : {};
 
-      const statusDescription = "Post 1 Signal Logged (+2 Cuts Added)";
+      const machineDef = SUPPORTED_MACHINES.find((m) => m.machineId === targetMachineId) || {
+        machineId: targetMachineId,
+        machineName: machineData.machineName || "Cutting Machine",
+        defaultMeterCount: 2.50
+      };
+
+      const machineName = machineData.machineName || machineDef.machineName;
+      // Assigned meter count for this machine
+      const assignedMeterCount = machineData.meterCount !== undefined
+        ? Number(machineData.meterCount)
+        : !isNaN(Number(params.meterCount))
+          ? Number(params.meterCount)
+          : machineDef.defaultMeterCount || 2.50;
+
+      // Active Production Order for this machine
+      let orderNumber =
+        machineData.currentProductionOrder?.orderNumber ||
+        machineData.productionOrder ||
+        params.productionOrder ||
+        "";
+      if (!orderNumber) {
+        try {
+          const poSnap = await db.collection("settings").doc("production_order").get();
+          if (poSnap.exists) orderNumber = poSnap.data().orderNumber || "";
+        } catch (poErr) { }
+      }
+
+      const statusDescription = `Post 1 Signal Logged (+1 Cut Added on ${machineName})`;
 
       // Write record into Firestore `cuts` collection
       const cutPayload = {
+        machineId: targetMachineId,
+        machineName,
         post: postValue,
         value: postValue,
         cutsAdded: cutsAdded,
+        meterCount: assignedMeterCount,
+        productionOrder: orderNumber || "PO-2026-001",
+        linearMetersProduced: Number((cutsAdded * assignedMeterCount).toFixed(2)),
         timestamp: slst.iso,
         timestampMs: currentMs,
         timeString: slst.timeString,
@@ -1452,7 +1838,7 @@ app.all(
           dailyRef,
           {
             date: slst.dateString,
-            machineId: MACHINE_ID,
+            machineId: targetMachineId,
             totalCuts: currentTotal,
             totalSignals: currentSignals,
             totalCycles: currentSignals,
@@ -1461,6 +1847,8 @@ app.all(
             lastCutsAdded: cutsAdded,
             lastCutTime: slst.iso,
             lastEntryTime: slst.iso,
+            productionOrder: orderNumber || "",
+            meterCount: assignedMeterCount,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           },
           { merge: true }
@@ -1471,20 +1859,33 @@ app.all(
       const isCurrentlyInDowntime =
         machineData.status === "DOWNTIME" && !!machineData.currentDowntimeId;
 
+      // Multiply counts by assigned meter count to give linear meters for that production order
+      const hourlyLinearMeters = Number((updatedHourlyVolume * assignedMeterCount).toFixed(2));
+      const totalLinearMetersToday = Number((updatedTotalCuts * assignedMeterCount).toFixed(2));
+
       await machineRef.set(
         {
-          machineId: MACHINE_ID,
-          machineName: MACHINE_NAME,
+          machineId: targetMachineId,
+          machineName,
           company: COMPANY_NAME,
           sector: SECTOR_NAME,
           status: isCurrentlyInDowntime ? "DOWNTIME" : "RUNNING",
           currentSignalState: postValue,
           lastPost: postValue,
           lastCutsAdded: cutsAdded,
+          meterCount: assignedMeterCount,
+          currentProductionOrder: {
+            orderNumber: orderNumber || "",
+            meterCount: assignedMeterCount,
+            date: slst.dateString,
+            updatedAt: slst.iso
+          },
           lastTimestamp: slst.iso,
           lastTimestampMs: currentMs,
           todayCutsCount: updatedTotalCuts,
           todaySignalsCount: updatedTotalSignals,
+          todayLinearMeters: totalLinearMetersToday,
+          currentHourLinearMeters: hourlyLinearMeters,
           lastCutTime: slst.iso,
           lastActivityMs: currentMs,
           lastActivityIso: slst.iso,
@@ -1497,9 +1898,14 @@ app.all(
         ok: 1,
         post: postValue,
         cutsAdded: cutsAdded,
+        machineId: targetMachineId,
+        machineName,
+        productionOrder: orderNumber || "",
+        meterCount: assignedMeterCount,
         hourlyVolume: updatedHourlyVolume,
+        hourlyLinearMeters: hourlyLinearMeters,
         totalCutsToday: updatedTotalCuts,
-        totalSignalsToday: updatedTotalSignals,
+        totalLinearMetersToday: totalLinearMetersToday,
         timestamp: slst.iso,
         status: statusDescription,
         id: cutRef.id,
@@ -1513,20 +1919,203 @@ app.all(
 );
 
 /**
+ * GET /api/machines
+ * Returns all supported machines with assigned meter counts & current production orders
+ */
+app.get(["/machines", "/api/machines"], async (req, res) => {
+  try {
+    const list = [];
+    const snap = await db.collection("machines").get();
+    const existing = {};
+    snap.forEach((d) => {
+      existing[d.id] = { id: d.id, ...d.data() };
+    });
+
+    for (const def of SUPPORTED_MACHINES) {
+      if (existing[def.machineId]) {
+        list.push(existing[def.machineId]);
+      } else {
+        const seeded = {
+          machineId: def.machineId,
+          machineName: def.machineName,
+          company: def.company,
+          sector: def.sector,
+          status: "RUNNING",
+          meterCount: def.defaultMeterCount,
+          currentProductionOrder: {
+            orderNumber: "",
+            meterCount: def.defaultMeterCount
+          },
+          todayCutsCount: 0,
+          todayLinearMeters: 0
+        };
+        await db.collection("machines").doc(def.machineId).set(seeded, { merge: true });
+        list.push({ id: def.machineId, ...seeded });
+      }
+    }
+    return res.status(200).json({ success: true, count: list.length, machines: list });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/production-order
+ * Returns active Production Order number & assigned meter count
+ */
+app.get(["/production-order", "/api/production-order"], async (req, res) => {
+  try {
+    const machineId = req.query.machineId || MACHINE_ID;
+    let orderData = { machineId, orderNumber: "", meterCount: 2.50 };
+    const mSnap = await db.collection("machines").doc(machineId).get();
+    if (mSnap.exists && mSnap.data().currentProductionOrder) {
+      orderData = { ...mSnap.data().currentProductionOrder, meterCount: mSnap.data().meterCount || 2.50 };
+    } else {
+      const docSnap = await db.collection("settings").doc("production_order").get();
+      if (docSnap.exists) orderData = docSnap.data();
+    }
+    return res.status(200).json({ success: true, productionOrder: orderData });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/production-order
+ * Sets active Production Order number & assigned meter count for a machine
+ */
+app.post(["/production-order", "/api/production-order"], async (req, res) => {
+  try {
+    const { machineId, orderNumber, meterCount, linearMetersPerHour, notes } = req.body || {};
+    const targetMachineId = machineId || MACHINE_ID;
+    const assignedMeterCount = !isNaN(Number(meterCount))
+      ? Math.max(0, Number(meterCount))
+      : !isNaN(Number(linearMetersPerHour))
+        ? Math.max(0, Number(linearMetersPerHour))
+        : 2.50;
+
+    const slst = getSLSTDate();
+    const payload = {
+      machineId: targetMachineId,
+      orderNumber: orderNumber !== undefined ? String(orderNumber).trim() : "",
+      meterCount: assignedMeterCount,
+      linearMetersPerHour: assignedMeterCount,
+      notes: notes !== undefined ? String(notes).trim() : "",
+      updatedAt: slst.iso,
+      updatedAtFormatted: slst.formatted
+    };
+
+    await db.collection("settings").doc(`production_order_${targetMachineId}`).set(payload, { merge: true });
+    await db.collection("settings").doc("production_order").set(payload, { merge: true });
+    await db.collection("machines").doc(targetMachineId).set(
+      {
+        meterCount: assignedMeterCount,
+        currentProductionOrder: payload,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: `Production order and assigned meter count updated for ${targetMachineId}.`,
+      productionOrder: payload
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/machines/master or POST /api/machines/:machineId
+ * Updates machine master configuration (display name, meter factor, specifications/notes)
+ */
+app.post(
+  ["/machines/master", "/api/machines/master", "/machines/:machineId", "/api/machines/:machineId"],
+  async (req, res) => {
+    try {
+      const targetId = req.params?.machineId || req.body?.machineId || MACHINE_ID;
+      const { machineName, meterCount, defaultMeterCount, notes, orderNumber } = req.body || {};
+      const slst = getSLSTDate();
+
+      const rate = !isNaN(Number(meterCount))
+        ? Math.max(0.1, Number(meterCount))
+        : !isNaN(Number(defaultMeterCount))
+          ? Math.max(0.1, Number(defaultMeterCount))
+          : 2.50;
+
+      const machDef = SUPPORTED_MACHINES.find((m) => m.machineId === targetId) || {};
+      const cleanName = (machineName && String(machineName).trim()) || machDef.machineName || targetId;
+      const cleanNotes = notes !== undefined ? String(notes).trim() : "";
+      const cleanOrderNumber = orderNumber !== undefined ? String(orderNumber).trim() : "";
+
+      const updatePayload = {
+        machineId: targetId,
+        machineName: cleanName,
+        meterCount: rate,
+        defaultMeterCount: rate,
+        notes: cleanNotes,
+        updatedAt: slst.iso,
+        updatedAtFormatted: slst.formatted,
+        serverTimestamp: admin.firestore.FieldValue.serverTimestamp()
+      };
+
+      if (cleanOrderNumber) {
+        updatePayload.currentProductionOrder = {
+          orderNumber: cleanOrderNumber,
+          meterCount: rate,
+          linearMetersPerHour: rate,
+          notes: cleanNotes,
+          updatedAt: slst.iso
+        };
+      }
+
+      await db.collection("machines").doc(targetId).set(updatePayload, { merge: true });
+
+      await db.collection("settings").doc(`production_order_${targetId}`).set(
+        {
+          machineId: targetId,
+          meterCount: rate,
+          linearMetersPerHour: rate,
+          ...(cleanOrderNumber ? { orderNumber: cleanOrderNumber } : {}),
+          notes: cleanNotes,
+          updatedAt: slst.iso
+        },
+        { merge: true }
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: `Master details saved for ${cleanName}.`,
+        machine: updatePayload
+      });
+    } catch (error) {
+      console.error("Machine master save error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/**
  * POST /api/downtime or /api/downtime/start
- * Creates/starts an active downtime record when a downtime occurs.
- * The same downtime remains active until ended via POST /api/downtime/end.
+ * Creates/starts an active downtime record for a specific machine.
  */
 app.post(
   ["/downtime", "/downtime/start", "/idle", "/api/downtime", "/api/downtime/start", "/api/idle"],
   async (req, res) => {
     try {
+      const targetMachineId = req.body?.machineId || req.query?.machineId || MACHINE_ID;
+      const machDef = SUPPORTED_MACHINES.find((m) => m.machineId === targetMachineId) || {
+        machineId: targetMachineId,
+        machineName: targetMachineId
+      };
       const slst = getSLSTDate(req.body?.startTime || new Date());
-      const machineRef = db.collection("machines").doc(MACHINE_ID);
+      const machineRef = db.collection("machines").doc(targetMachineId);
       const machineDoc = await machineRef.get();
       const machineData = machineDoc.exists ? machineDoc.data() : {};
+      const machineName = machineData.machineName || machDef.machineName;
 
-      // Check if there is already an active downtime
+      // Check if this machine already has an active downtime
       if (machineData.status === "DOWNTIME" && machineData.currentDowntimeId) {
         const existingSnap = await db.collection("downtime").doc(machineData.currentDowntimeId).get();
         if (existingSnap.exists && existingSnap.data().active) {
@@ -1535,9 +2124,11 @@ app.post(
             success: true,
             alreadyActive: true,
             status: "DOWNTIME",
+            machineId: targetMachineId,
+            machineName,
             downtimeId: existingSnap.id,
             downtime: { id: existingSnap.id, ...existingData },
-            message: "An active downtime is already in progress. End the current downtime before starting a new one."
+            message: `An active downtime is already in progress on ${machineName}. End the current downtime before starting a new one.`
           });
         }
       }
@@ -1546,8 +2137,8 @@ app.post(
       const source = req.body?.source || "web";
 
       const downtimePayload = {
-        machineId: MACHINE_ID,
-        machineName: MACHINE_NAME,
+        machineId: targetMachineId,
+        machineName,
         active: true,
         reason,
         source,
@@ -1569,6 +2160,8 @@ app.post(
 
       const activeDowntimeSummary = {
         id: dtRef.id,
+        machineId: targetMachineId,
+        machineName,
         active: true,
         reason,
         source,
@@ -1580,6 +2173,8 @@ app.post(
 
       await machineRef.set(
         {
+          machineId: targetMachineId,
+          machineName,
           status: "DOWNTIME",
           currentDowntimeId: dtRef.id,
           activeDowntime: activeDowntimeSummary,
@@ -1593,10 +2188,12 @@ app.post(
       return res.status(200).json({
         success: true,
         status: "DOWNTIME",
+        machineId: targetMachineId,
+        machineName,
         downtimeId: dtRef.id,
         downtime: activeDowntimeSummary,
         serverTime: slst.formatted,
-        message: "Downtime started and logged."
+        message: `Downtime started on ${machineName}.`
       });
     } catch (error) {
       console.error("Downtime start error:", error);
@@ -1607,19 +2204,29 @@ app.post(
 
 /**
  * POST /api/downtime/end
- * Ends the active downtime that was previously started.
+ * Ends the active downtime for a specific machine.
  */
 app.post(["/downtime/end", "/api/downtime/end"], async (req, res) => {
   try {
     const customTime = req.body?.endTime || req.body?.timestamp || req.body?.endMs;
     const slst = getSLSTDate(customTime || new Date());
-    const machineRef = db.collection("machines").doc(MACHINE_ID);
+    const specificDtId = req.body?.downtimeId;
+    let targetMachineId = req.body?.machineId || req.query?.machineId || null;
+
+    if (specificDtId) {
+      const dtDoc = await db.collection("downtime").doc(specificDtId).get();
+      if (dtDoc.exists && dtDoc.data().machineId) {
+        targetMachineId = dtDoc.data().machineId;
+      }
+    }
+    if (!targetMachineId) targetMachineId = MACHINE_ID;
+
+    const machineRef = db.collection("machines").doc(targetMachineId);
     const machineDoc = await machineRef.get();
     const machineData = machineDoc.exists ? machineDoc.data() : {};
 
-    const specificDtId = req.body?.downtimeId;
     const resolvedBy = req.body?.resolvedBy || "Ended via Web App";
-    const resolved = await resolveActiveDowntimeIfAny(machineData, slst, resolvedBy, specificDtId);
+    const resolved = await resolveActiveDowntimeIfAny(machineData, slst, resolvedBy, specificDtId, targetMachineId);
 
     await machineRef.set(
       {
@@ -1634,12 +2241,13 @@ app.post(["/downtime/end", "/api/downtime/end"], async (req, res) => {
     return res.status(200).json({
       success: true,
       status: "RUNNING",
+      machineId: targetMachineId,
       downtimeResolved: resolved,
       resolvedAt: slst.formatted,
       resolvedTimeStr: slst.timeString,
       message: resolved
-        ? `Downtime ended successfully at ${slst.timeString} (Duration: ${resolved.durationMinutes}m / ${resolved.durationSeconds}s).`
-        : `Machine status set to RUNNING at ${slst.timeString}.`
+        ? `Downtime ended successfully on ${targetMachineId} at ${slst.timeString} (Duration: ${resolved.durationMinutes}m).`
+        : `Machine status set to RUNNING.`
     });
   } catch (error) {
     console.error("Downtime end error:", error);
@@ -1664,27 +2272,29 @@ app.get(
     try {
       const slstNow = getSLSTDate();
       const dateStr = req.query.date || slstNow.dateString;
+      const targetMachineId = req.query.machineId || null;
 
-      const machineDoc = await db.collection("machines").doc(MACHINE_ID).get();
-      const machineData = machineDoc.exists ? machineDoc.data() : {};
+      let dtQuery = db.collection("downtime").where("date", "==", dateStr);
+      if (targetMachineId && targetMachineId !== "all") {
+        dtQuery = dtQuery.where("machineId", "==", targetMachineId);
+      }
 
-      const dtSnap = await db
-        .collection("downtime")
-        .where("date", "==", dateStr)
-        .get();
-
+      const dtSnap = await dtQuery.get();
       const downtimes = [];
       dtSnap.forEach((doc) => {
         downtimes.push({ id: doc.id, ...doc.data() });
       });
       downtimes.sort((a, b) => (b.startMs || 0) - (a.startMs || 0));
 
-      // Also check if there's any active downtime across the collection
+      // Find active downtime (optionally for targetMachineId)
       let activeDowntime = downtimes.find((d) => d.active === true) || null;
-      if (!activeDowntime && machineData.currentDowntimeId) {
-        const currentDtDoc = await db.collection("downtime").doc(machineData.currentDowntimeId).get();
-        if (currentDtDoc.exists && currentDtDoc.data().active) {
-          activeDowntime = { id: currentDtDoc.id, ...currentDtDoc.data() };
+      if (!activeDowntime && targetMachineId && targetMachineId !== "all") {
+        const mDoc = await db.collection("machines").doc(targetMachineId).get();
+        if (mDoc.exists && mDoc.data().currentDowntimeId) {
+          const currentDtDoc = await db.collection("downtime").doc(mDoc.data().currentDowntimeId).get();
+          if (currentDtDoc.exists && currentDtDoc.data().active) {
+            activeDowntime = { id: currentDtDoc.id, ...currentDtDoc.data() };
+          }
         }
       }
 
@@ -1712,6 +2322,7 @@ app.get(
       return res.status(200).json({
         success: true,
         date: dateStr,
+        machineId: targetMachineId || "all",
         hasActiveDowntime,
         hasDowntimeCreatedToday: downtimes.length > 0,
         machineStatus: hasActiveDowntime ? "DOWNTIME" : "RUNNING",
@@ -1767,8 +2378,9 @@ app.all(["/reports/generate", "/api/reports/generate"], async (req, res) => {
 
     const targetDate = req.body?.date || req.query?.date || yesterdayStr;
     const reportType = req.body?.type || req.query?.type || "hourly";
+    const machineId = req.body?.machineId || req.query?.machineId || null;
 
-    const reportRecord = await executeDailyPdfReportPipeline(targetDate, reportType);
+    const reportRecord = await executeDailyPdfReportPipeline(targetDate, reportType, machineId);
 
     return res.status(200).json({
       success: true,
@@ -1905,6 +2517,7 @@ app.get(["/reports/download/file/:fileName", "/api/reports/download/file/:fileNa
 
 /**
  * POST /api/archive/rotate
+ * Manual trigger for daily report pipeline, archive rotation & fresh order slate across all machines
  */
 app.post(["/archive/rotate", "/api/archive/rotate"], async (req, res) => {
   try {
@@ -1912,15 +2525,53 @@ app.post(["/archive/rotate", "/api/archive/rotate"], async (req, res) => {
     const yesterdayDate = new Date(slstNow.date.getTime() - 24 * 60 * 60 * 1000);
     const targetDate = req.body?.date || req.query?.date || getSLSTDate(yesterdayDate).dateString;
 
-    const hourlyRep = await executeDailyPdfReportPipeline(targetDate, "hourly");
-    const dtRep = await executeDailyPdfReportPipeline(targetDate, "downtime");
+    const generatedReports = [];
+
+    // 1. Generate Hourly & Downtime PDF reports for ALL individual machines
+    for (const mach of SUPPORTED_MACHINES) {
+      const hRep = await executeDailyPdfReportPipeline(targetDate, "hourly", mach.machineId);
+      const dtRep = await executeDailyPdfReportPipeline(targetDate, "downtime", mach.machineId);
+      generatedReports.push(hRep, dtRep);
+    }
+
+    // 2. Generate Consolidated Fleet Hourly & Downtime reports across all machines
+    const fleetHRep = await executeDailyPdfReportPipeline(targetDate, "hourly", "all");
+    const fleetDtRep = await executeDailyPdfReportPipeline(targetDate, "downtime", "all");
+    generatedReports.push(fleetHRep, fleetDtRep);
+
+    // 3. Move target date raw telemetry to archive collections
     const rotation = await archiveAndRotateDailyData(targetDate);
+
+    // 4. Reset orders on all machines so the new day starts fresh without carry-over
+    for (const mach of SUPPORTED_MACHINES) {
+      try {
+        await db.collection("machines").doc(mach.machineId).set(
+          {
+            currentProductionOrder: {
+              orderNumber: "",
+              date: slstNow.dateString,
+              updatedAt: slstNow.iso
+            }
+          },
+          { merge: true }
+        );
+      } catch (e) {
+        console.warn(`Could not reset order for ${mach.machineId}:`, e.message);
+      }
+    }
 
     return res.status(200).json({
       success: true,
-      message: `PDF Reports for ${targetDate} saved to Firebase Storage & Firestore. Data rotated to archive lists.`,
-      hourlyReportId: hourlyRep.id,
-      downtimeReportId: dtRep.id,
+      message: `PDF Reports for all machines and consolidated fleet on ${targetDate} saved to Firebase Storage & Firestore. Data rotated to archive lists. Fresh order slate initialized.`,
+      targetDate,
+      reportsCount: generatedReports.length,
+      reports: generatedReports.map((r) => ({
+        id: r.id,
+        title: r.title,
+        fileName: r.fileName,
+        machineId: r.machineId,
+        reportType: r.reportType
+      })),
       rotation
     });
   } catch (err) {
@@ -1962,10 +2613,91 @@ app.get(["/archive/status", "/api/archive/status"], async (req, res) => {
       activeDowntimesCount: dtSnap.data().count,
       archivedDowntimesCount: archiveDtSnap.data().count,
       totalStoredReports: reportsSnap.data().count,
+      archiveRetentionPolicy: "PERMANENT_RETENTION",
       serverTimeSLST: getSLSTDate().formatted
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/archive/cuts
+ * Retrieve archived cuts telemetry between `from` and `to` (YYYY-MM-DD)
+ */
+app.get(["/archive/cuts", "/api/archive/cuts"], async (req, res) => {
+  try {
+    const slstNow = getSLSTDate();
+    const from = (req.query.from || "").trim();
+    const to = (req.query.to || slstNow.dateString).trim();
+    const targetMachineId = (req.query.machineId || "all").trim();
+    const limitNum = Math.min(Number(req.query.limit) || 3000, 10000);
+
+    let queryRef = db.collection("cuts_archive");
+    if (from && to) {
+      queryRef = queryRef.where("date", ">=", from).where("date", "<=", to);
+    } else if (from) {
+      queryRef = queryRef.where("date", ">=", from);
+    } else if (to) {
+      queryRef = queryRef.where("date", "<=", to);
+    }
+
+    const snap = await queryRef.limit(limitNum).get();
+    let records = [];
+    snap.forEach((doc) => {
+      records.push({ id: doc.id, source: "archive", ...doc.data() });
+    });
+
+    // Seamlessly include today's active live cuts if requested range includes today
+    if ((!to || to >= slstNow.dateString) && (!from || from <= slstNow.dateString)) {
+      const liveSnap = await db.collection("cuts").where("date", "==", slstNow.dateString).get();
+      liveSnap.forEach((doc) => {
+        if (!records.some((r) => r.id === doc.id)) {
+          records.push({ id: doc.id, source: "active_today", ...doc.data() });
+        }
+      });
+    }
+
+    if (targetMachineId && targetMachineId !== "all") {
+      records = records.filter(
+        (r) =>
+          r.machineId === targetMachineId ||
+          (!r.machineId && targetMachineId === "rubberised_coir_cutter")
+      );
+    }
+
+    // Sort descending by timestamp
+    records.sort((a, b) => (b.timestampMs || 0) - (a.timestampMs || 0));
+
+    let totalCuts = 0;
+    let totalLinearMeters = 0;
+    const distinctOrders = new Set();
+    const distinctMachines = new Set();
+
+    for (const r of records) {
+      const cuts = r.cutsAdded || 1;
+      totalCuts += cuts;
+      totalLinearMeters += r.linearMetersProduced || Number((cuts * (r.meterCount || 2.5)).toFixed(2));
+      if (r.productionOrder) distinctOrders.add(r.productionOrder);
+      if (r.machineId) distinctMachines.add(r.machineId);
+    }
+
+    return res.status(200).json({
+      success: true,
+      count: records.length,
+      from,
+      to,
+      machineId: targetMachineId,
+      summary: {
+        totalCuts,
+        totalLinearMeters: Number(totalLinearMeters.toFixed(2)),
+        distinctOrdersCount: distinctOrders.size,
+        distinctMachinesCount: distinctMachines.size
+      },
+      cuts: records
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -2069,9 +2801,37 @@ exports.dailyMidnightReportScheduler = onSchedule(
       const yesterdayDate = new Date(slstNow.date.getTime() - 24 * 60 * 60 * 1000);
       const yesterdayStr = getSLSTDate(yesterdayDate).dateString;
 
-      await executeDailyPdfReportPipeline(yesterdayStr, "hourly");
-      await executeDailyPdfReportPipeline(yesterdayStr, "downtime");
+      // 1. Generate Hourly & Downtime PDF reports for ALL individual machines
+      for (const mach of SUPPORTED_MACHINES) {
+        await executeDailyPdfReportPipeline(yesterdayStr, "hourly", mach.machineId);
+        await executeDailyPdfReportPipeline(yesterdayStr, "downtime", mach.machineId);
+      }
+
+      // 2. Generate Consolidated Fleet Hourly & Downtime reports across all machines
+      await executeDailyPdfReportPipeline(yesterdayStr, "hourly", "all");
+      await executeDailyPdfReportPipeline(yesterdayStr, "downtime", "all");
+
+      // 3. Move yesterday's raw cut & downtime telemetry to archives
       await archiveAndRotateDailyData(yesterdayStr);
+
+      // 4. Reset orders on all machines so the new day starts fresh without carry-over
+      for (const mach of SUPPORTED_MACHINES) {
+        try {
+          await db.collection("machines").doc(mach.machineId).set(
+            {
+              currentProductionOrder: {
+                orderNumber: "",
+                date: slstNow.dateString,
+                updatedAt: slstNow.iso
+              }
+            },
+            { merge: true }
+          );
+        } catch (e) {
+          console.warn(`Could not reset order for ${mach.machineId}:`, e.message);
+        }
+      }
+
       return null;
     } catch (err) {
       console.error("Scheduled midnight report & archive rotation failed:", err);
