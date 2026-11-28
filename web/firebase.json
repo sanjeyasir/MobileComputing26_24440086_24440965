@@ -1,0 +1,44 @@
+{
+  "hosting": {
+    "site": "msc-mobile-computing-project",
+    "public": "dist",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "/docs",
+        "destination": "/docs.html"
+      },
+      {
+        "source": "/swagger",
+        "destination": "/docs.html"
+      },
+      {
+        "source": "/api/docs",
+        "destination": "/docs.html"
+      },
+      {
+        "source": "/api/swagger",
+        "destination": "/docs.html"
+      },
+      {
+        "source": "/api/**",
+        "function": "api"
+      },
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  },
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "functions": {
+    "source": "functions"
+  }
+}
